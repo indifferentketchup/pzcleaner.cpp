@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(PZCLEANER_VERSION "dev" CACHE STRING "Release version, without the v; dev builds never update themselves")
 
 include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
@@ -24,6 +25,10 @@ FetchContent_Declare(imgui
 FetchContent_Declare(json
     URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
     URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa)
+FetchContent_Declare(httplib
+    URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.63.0.tar.gz
+    URL_HASH SHA256=44ab42e16926e95f7641d286bc90d739ab1c16886114d7cc5bc7a9f905c5edf8
+    SOURCE_SUBDIR header-only)
 FetchContent_Declare(sqlite
     URL https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip
     URL_HASH SHA256=0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9)
@@ -72,6 +77,8 @@ target_link_libraries(imgui PUBLIC SDL3::SDL3-static)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(json)
 
+FetchContent_MakeAvailable(httplib)
+
 FetchContent_MakeAvailable(sqlite)
 add_library(sqlite3 STATIC ${sqlite_SOURCE_DIR}/sqlite3.c)
 target_include_directories(sqlite3 PUBLIC ${sqlite_SOURCE_DIR})
@@ -95,8 +102,10 @@ add_executable(pzcleaner WIN32
     src/app.cpp
     src/sftp.cpp
     src/store.cpp
+    src/update.cpp
     ${CMAKE_BINARY_DIR}/assets.cpp)
-target_include_directories(pzcleaner PRIVATE src)
+target_include_directories(pzcleaner PRIVATE src ${httplib_SOURCE_DIR})
+target_compile_definitions(pzcleaner PRIVATE PZCLEANER_VERSION="${PZCLEANER_VERSION}" CPPHTTPLIB_MBEDTLS_SUPPORT)
 if(NOT MSVC)
     target_compile_options(pzcleaner PRIVATE -Wall -Wextra)
 endif()
@@ -104,11 +113,16 @@ target_link_libraries(pzcleaner PRIVATE
     imgui
     SDL3::SDL3-static
     libssh2::libssh2_static
+    mbedtls
+    mbedx509
+    mbedcrypto
     nlohmann_json::nlohmann_json
     sqlite3)
 if(WIN32)
     target_compile_definitions(pzcleaner PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(pzcleaner PRIVATE ws2_32)
-elseif(NOT APPLE)
+    target_link_libraries(pzcleaner PRIVATE ws2_32 crypt32)
+elseif(APPLE)
+    target_link_libraries(pzcleaner PRIVATE "-framework CoreFoundation" "-framework Security")
+else()
     target_link_options(pzcleaner PRIVATE -static-libstdc++ -static-libgcc)
 endif()

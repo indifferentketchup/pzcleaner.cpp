@@ -28,7 +28,7 @@ jobs:
               exit 1
             fi
           }
-          build cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          build cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DPZCLEANER_VERSION=${GITHUB_REF_NAME#v}"
           build cmake --build build
       - name: Package AppImage
         run: |
@@ -60,7 +60,7 @@ jobs:
               exit 1
             fi
           }
-          build cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          build cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DPZCLEANER_VERSION=${GITHUB_REF_NAME#v}"
           build cmake --build build --config Release
           cp build/Release/pzcleaner.exe pzcleaner-windows-amd64.exe
       - uses: actions/upload-artifact@v4
@@ -83,7 +83,7 @@ jobs:
               exit 1
             fi
           }
-          build cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          build cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" "-DPZCLEANER_VERSION=${GITHUB_REF_NAME#v}"
           build cmake --build build
       - name: Package app
         run: |
@@ -91,6 +91,7 @@ jobs:
           cp build/pzcleaner pzcleaner.app/Contents/MacOS/pzcleaner
           strip pzcleaner.app/Contents/MacOS/pzcleaner
           printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>CFBundleName</key><string>pzcleaner</string><key>CFBundleExecutable</key><string>pzcleaner</string><key>CFBundleIdentifier</key><string>com.indifferentketchup.pzcleaner</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>%s</string><key>NSHighResolutionCapable</key><true/></dict></plist>\n' "${GITHUB_REF_NAME#v}" > pzcleaner.app/Contents/Info.plist
+          codesign --force --deep --sign - pzcleaner.app
           ditto -c -k --keepParent pzcleaner.app pzcleaner-macos.zip
       - uses: actions/upload-artifact@v4
         with:

@@ -115,6 +115,7 @@ int run() {
             ImGui_ImplSDL3_NewFrame();
             ImGui::NewFrame();
             ui.draw();
+            done = ui.quitRequested();
             ImGui::Render();
             SDL_SetRenderScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
             SDL_SetRenderDrawColor(renderer, 0x0A, 0x14, 0x1E, 0xFF);

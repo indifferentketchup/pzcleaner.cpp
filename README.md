@@ -37,6 +37,19 @@ checksum. Pushing a `v*` tag builds them with GitHub Actions
 If the window stays black on a machine with broken graphics drivers, start
 it with `SDL_RENDER_DRIVER=software`.
 
+## Updates
+
+On start, pzcleaner asks GitHub for the latest release. If it is newer, a
+bar offers Update, What's new and Later; nothing is downloaded until Update
+is pressed. Update downloads this platform's file from the release, checks
+it against the release's `SHA256SUMS.txt` and puts it in place of the
+running copy (the AppImage file, the `.exe`, or `pzcleaner.app`), then
+offers to restart. A copy that can't replace itself, for example one in a
+folder it can't write to or a Mac app run straight from Downloads, links to
+the release page instead. Builds without a release version (`dev`, the
+default for local builds) never check. CI stamps the version from the tag
+with `-DPZCLEANER_VERSION`.
+
 It logs in with the SFTP host, port, user and password from the server
 host's panel; no SSH keys are needed. The first connection to a server shows
 its host key fingerprint and remembers it once trusted, in
@@ -62,10 +75,12 @@ server that has nothing but an Ed25519 key.
 - `src/mapview.cpp`: the map, with pan, zoom and box drawing.
 - `src/ui.cpp` and `src/main.cpp`: the window, the open dialog and the
   steps.
+- `src/update.cpp`: the update check and install (cpp-httplib over mbedTLS,
+  trusting the system's certificate store).
 
 CMake fetches every dependency as a pinned, hash-checked source archive:
-SDL 3.4.18, Dear ImGui 1.93.0, mbedTLS 3.6.7, libssh2 1.11.1, nlohmann/json
-3.12.0 and SQLite 3.54.1. The font is Roboto Medium from Dear ImGui's
+SDL 3.4.18, Dear ImGui 1.93.0, mbedTLS 3.6.7, libssh2 1.11.1, cpp-httplib
+0.63.0, nlohmann/json 3.12.0 and SQLite 3.54.1. The font is Roboto Medium from Dear ImGui's
 `misc/fonts`.
 
 ```bash

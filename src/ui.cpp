@@ -2,6 +2,7 @@
 
 #include "assets.hpp"
 #include "text.hpp"
+#include "update.hpp"
 
 #include <imgui.h>
 #include <imgui_stdlib.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -230,6 +232,12 @@ float buttonWidth(const char* label) {
     return ImGui::CalcTextSize(label, nullptr, true).x + ImGui::GetStyle().FramePadding.x * 2;
 }
 
+std::string megabytes(std::uint64_t bytes) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    return text;
+}
+
 nlohmann::json rectJson(const ChunkRect& rect) {
     return {{"x0", rect.x0}, {"y0", rect.y0}, {"x1", rect.x1}, {"y1", rect.y1}};
 }
@@ -306,6 +314,10 @@ Ui::Ui(SDL_Window* window, SDL_Renderer* renderer, std::string configDir)
            }),
       map_(renderer) {
     loadSettings();
+    update::cleanUp();
+    if (update::isRelease()) {
+        checkForUpdate();
+    }
     if (const Asset* asset = findAsset("broccoli-mark.png")) {
         if (SDL_Surface* surface = SDL_LoadPNG_IO(SDL_IOFromConstMem(asset->data, asset->size), true)) {
             SDL_SetWindowIcon(window_, surface);
@@ -453,6 +465,46 @@ std::vector<Ui::KeepBox> Ui::loadKeeps(const std::string& name) const {
         }
     }
     return keeps;
+}
+
+void Ui::checkForUpdate() {
+    auto tag = std::make_shared<std::string>();
+    background(
+        [tag] {
+            std::string latest = update::latestTag();
+            if (update::isNewer(latest)) {
+                *tag = latest;
+            }
+        },
+        [this, tag](const std::string& error) {
+            if (error.empty() && !tag->empty()) {
+                updateTag_ = *tag;
+                updateState_ = UpdateState::Available;
+            }
+        });
+}
+
+void Ui::startUpdate() {
+    updateState_ = UpdateState::Downloading;
+    updateDone_ = 0;
+    updateTotal_ = 0;
+    std::string tag = updateTag_;
+    background(
+        [this, tag] {
+            update::install(tag, [this](std::uint64_t done, std::uint64_t total) {
+                updateDone_ = done;
+                updateTotal_ = total;
+                wakeLoop();
+            });
+        },
+        [this](const std::string& error) {
+            if (!error.empty()) {
+                updateError_ = error;
+                updateState_ = UpdateState::Failed;
+                return;
+            }
+            updateState_ = UpdateState::Ready;
+        });
 }
 
 void Ui::openDialog() {
@@ -914,6 +966,7 @@ void Ui::draw() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollWithMouse);
     drawHeader();
+    drawUpdate();
     float em = ImGui::GetFontSize();
     float side = std::clamp(ImGui::GetContentRegionAvail().x * 0.34f, em * 26, em * 34);
     ImGui::BeginChild("side", ImVec2(side, 0));
@@ -959,8 +1012,74 @@ void Ui::drawHeader() {
     ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
     ImGui::TextUnformatted("indifferent broccoli chunk cleaner tool for project zomboid");
     ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (update::isRelease()) {
+        ImGui::TextColored(kFaint, "v%s", update::currentVersion());
+    } else {
+        ImGui::TextColored(kFaint, "dev build");
+    }
     ImGui::EndGroup();
     ImGui::Spacing();
+}
+
+void Ui::drawUpdate() {
+    if (updateState_ == UpdateState::None) {
+        return;
+    }
+    std::string version = updateTag_;
+    if (!version.empty() && version[0] == 'v') {
+        version.erase(0, 1);
+    }
+    beginPanel("update");
+    if (updateState_ == UpdateState::Available) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(("pzcleaner " + version + " is out. You have " + update::currentVersion() + ".").c_str());
+        ImGui::SameLine();
+        if (primaryButton("Update")) {
+            startUpdate();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("What's new")) {
+            SDL_OpenURL(update::releasePage(updateTag_).c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Later")) {
+            updateState_ = UpdateState::None;
+        }
+    } else if (updateState_ == UpdateState::Downloading) {
+        std::string text = "Downloading pzcleaner " + version;
+        if (updateTotal_ > 0) {
+            text += ", " + megabytes(updateDone_) + " of " + megabytes(updateTotal_) + " MB";
+        }
+        ImVec4 color = kInfo;
+        color.w = 0.6f + 0.4f * static_cast<float>(std::sin(ImGui::GetTime() * 4.0));
+        coloredWrapped(color, text);
+    } else if (updateState_ == UpdateState::Ready) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(("pzcleaner " + version + " is installed and starts the next time you open it.").c_str());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(locked());
+        if (primaryButton("Restart now")) {
+            if (update::relaunch()) {
+                quit_ = true;
+            } else {
+                updateError_ = "The new version could not be started. Close pzcleaner and open it again.";
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("What's new")) {
+            SDL_OpenURL(update::releasePage(updateTag_).c_str());
+        }
+        errorText(updateError_);
+    } else {
+        coloredWrapped(kDanger, "pzcleaner " + version + " is out, but this copy could not update itself: " +
+                                    sentence(updateError_));
+        if (ImGui::Button("Open the download page")) {
+            SDL_OpenURL(update::releasePage(updateTag_).c_str());
+        }
+    }
+    endPanel();
 }
 
 void Ui::drawOpen() {

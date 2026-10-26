@@ -26,11 +26,13 @@ public:
     Ui& operator=(const Ui&) = delete;
 
     void draw();
-    bool animating() const { return opening_ || busy_ || connecting_; }
+    bool animating() const { return opening_ || busy_ || connecting_ || updateState_ == UpdateState::Downloading; }
+    bool quitRequested() const { return quit_; }
     bool shutDown();
 
 private:
     enum class Task { None, Scan, Delete, Restore };
+    enum class UpdateState { None, Available, Downloading, Ready, Failed };
 
     struct KeepBox {
         std::string name;
@@ -62,6 +64,8 @@ private:
     void runFinished();
     void resetProgress(Task task);
 
+    void checkForUpdate();
+    void startUpdate();
     void openDialog();
     void connect();
     void browseLocal();
@@ -97,6 +101,7 @@ private:
     std::vector<KeepBox> loadKeeps(const std::string& name) const;
 
     void drawHeader();
+    void drawUpdate();
     void drawOpen();
     void drawWorkspace();
     void drawBoxLists();
@@ -170,4 +175,11 @@ private:
 
     bool openConfirm_ = false;
     std::optional<Confirm> confirm_;
+
+    UpdateState updateState_ = UpdateState::None;
+    std::string updateTag_;
+    std::string updateError_;
+    std::atomic<std::uint64_t> updateDone_{0};
+    std::atomic<std::uint64_t> updateTotal_{0};
+    bool quit_ = false;
 };
