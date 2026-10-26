@@ -1,0 +1,109 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libgtk-3-dev libwebkit2gtk-4.1-dev
+      - name: Build
+        shell: bash
+        run: |
+          build() {
+            if ! "$@" > build.log 2>&1; then
+              tail -n 30 build.log | while IFS= read -r line; do echo "::error::$line"; done
+              exit 1
+            fi
+          }
+          build cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          build cmake --build build
+      - name: Package AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp build/pzcleaner AppDir/usr/bin/pzcleaner
+          strip AppDir/usr/bin/pzcleaner
+          cp site/brand/favicon-192.png AppDir/pzcleaner.png
+          printf '#!/bin/sh\nexec "$(dirname "$(readlink -f "$0")")/usr/bin/pzcleaner" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          printf '[Desktop Entry]\nType=Application\nName=pzcleaner\nComment=Reset parts of a Project Zomboid map\nExec=pzcleaner\nIcon=pzcleaner\nCategories=Game;Utility;\n' > AppDir/pzcleaner.desktop
+          curl -sSfL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool AppDir pzcleaner-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: pzcleaner-x86_64.AppImage
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: bash
+        run: |
+          build() {
+            if ! "$@" > build.log 2>&1; then
+              tail -n 30 build.log | while IFS= read -r line; do echo "::error::$line"; done
+              exit 1
+            fi
+          }
+          build cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          build cmake --build build --config Release
+          cp build/Release/pzcleaner.exe pzcleaner-windows-amd64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: pzcleaner-windows-amd64.exe
+
+  macos:
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: bash
+        run: |
+          build() {
+            if ! "$@" > build.log 2>&1; then
+              tail -n 30 build.log | while IFS= read -r line; do echo "::error::$line"; done
+              exit 1
+            fi
+          }
+          build cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          build cmake --build build
+      - name: Package app
+        run: |
+          mkdir -p pzcleaner.app/Contents/MacOS
+          cp build/pzcleaner pzcleaner.app/Contents/MacOS/pzcleaner
+          strip pzcleaner.app/Contents/MacOS/pzcleaner
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>CFBundleName</key><string>pzcleaner</string><key>CFBundleExecutable</key><string>pzcleaner</string><key>CFBundleIdentifier</key><string>com.indifferentketchup.pzcleaner</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>%s</string><key>NSHighResolutionCapable</key><true/><key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict></dict></plist>\n' "${GITHUB_REF_NAME#v}" > pzcleaner.app/Contents/Info.plist
+          ditto -c -k --keepParent pzcleaner.app pzcleaner-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: pzcleaner-macos.zip
+
+  release:
+    needs: [linux, windows, macos]
+    if: always() && needs.linux.result == 'success' && needs.windows.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
