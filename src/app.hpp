@@ -2,19 +2,48 @@
 
 #include "store.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
-class NamedError : public std::runtime_error {
-public:
-    NamedError(std::string name, const std::string& message) : std::runtime_error(message), name(std::move(name)) {}
+using Pairs = std::vector<std::pair<int, int>>;
+
+inline std::int64_t chunkKey(int x, int y) {
+    return (static_cast<std::int64_t>(x) << 32) ^ static_cast<std::uint32_t>(y);
+}
+
+struct ConnectRequest {
+    std::string host;
+    int port = 22;
+    std::string user;
+    std::string password;
+    std::string path;
+    std::string trust;
+};
+
+struct ConnectResult {
     std::string name;
+    std::string fingerprint;
+    std::string keyType;
+};
+
+struct ExecuteRequest {
+    Pairs chunks;
+    Pairs cells;
+    std::vector<std::string> cellKinds;
+    bool vehicles = false;
+    bool trash = true;
+};
+
+struct ExecuteResult {
+    std::int64_t cellFiles = 0;
+    std::vector<std::int64_t> vehicleIds;
+    std::string stamp;
 };
 
 class App {
@@ -24,19 +53,15 @@ public:
     App(std::string knownHosts, Progress progress)
         : knownHosts_(std::move(knownHosts)), progress_(std::move(progress)) {}
 
-    nlohmann::json connect(const nlohmann::json& request);
-    nlohmann::json openLocal(const std::string& dir);
+    ConnectResult connect(const ConnectRequest& request);
+    std::string openLocal(const std::string& dir);
     void disconnect();
-    nlohmann::json list(const std::string& rel);
-    nlohmann::json stat(const std::string& rel);
-    std::string read(const std::string& rel);
-    void write(const std::string& rel, const std::string& base64);
-    void mkdir(const std::string& rel);
-    void rename(const std::string& from, const std::string& to);
-    void remove(const std::string& rel, bool recursive);
-    nlohmann::json index(const std::string& rel);
-    nlohmann::json execute(const nlohmann::json& request);
+    Pairs index();
+    std::optional<std::string> readFile(const std::string& name);
+    std::vector<std::string> listTrash();
+    ExecuteResult execute(const ExecuteRequest& request);
     std::int64_t restore(const std::string& stamp);
+    void emptyTrash();
 
 private:
     struct Session {
@@ -45,9 +70,8 @@ private:
         std::string backup;
     };
 
-    nlohmann::json open(std::shared_ptr<Store> store, const std::string& root);
+    std::string open(std::shared_ptr<Store> store, const std::string& root);
     Session current();
-    std::pair<std::shared_ptr<Store>, std::string> resolve(const std::string& rel);
 
     std::string knownHosts_;
     Progress progress_;

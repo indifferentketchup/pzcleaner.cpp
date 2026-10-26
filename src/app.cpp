@@ -1,9 +1,8 @@
 #include "app.hpp"
 
-#include "base64.hpp"
+#include "database.hpp"
 
-#include <sqlite3.h>
-
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -14,11 +13,8 @@
 #include <thread>
 #include <unordered_set>
 
-using nlohmann::json;
-
 namespace {
 
-const std::string kTrashDir = "_pzcleaner_trash";
 const std::string kBackupFolder = "pzcleaner-backup";
 const std::string kVehiclesBackup = "vehicles.db.pzcleaner-bak";
 const std::set<std::string> kCellKinds = {"zpop", "apop", "chunkdata"};
@@ -107,89 +103,46 @@ std::string stampNow() {
     return out.str();
 }
 
-std::int64_t chunkKey(int x, int y) {
-    return (static_cast<std::int64_t>(x) << 32) ^ static_cast<std::uint32_t>(y);
+bool hasFolder(Store& store, const std::string& path) {
+    try {
+        return store.stat(path).dir;
+    } catch (const FsError& error) {
+        if (error.notFound) {
+            return false;
+        }
+        throw;
+    }
 }
 
-class Database {
-public:
-    explicit Database(const std::string& bytes) {
-        sqlite3_open(":memory:", &db_);
-        auto* buffer = static_cast<unsigned char*>(sqlite3_malloc64(bytes.size()));
-        std::copy(bytes.begin(), bytes.end(), buffer);
-        int rc = sqlite3_deserialize(db_, "main", buffer, static_cast<sqlite3_int64>(bytes.size()),
-                                     static_cast<sqlite3_int64>(bytes.size()),
-                                     SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE);
-        if (rc != SQLITE_OK) {
-            throw std::runtime_error("vehicles.db could not be opened");
-        }
-    }
-    ~Database() { sqlite3_close(db_); }
-
-    void exec(const char* sql) {
-        if (sqlite3_exec(db_, sql, nullptr, nullptr, nullptr) != SQLITE_OK) {
-            throw std::runtime_error(std::string("vehicles.db: ") + sqlite3_errmsg(db_));
-        }
-    }
-
-    sqlite3_stmt* prepare(const char* sql) {
-        sqlite3_stmt* statement = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK) {
-            throw std::runtime_error(std::string("vehicles.db: ") + sqlite3_errmsg(db_));
-        }
-        return statement;
-    }
-
-    std::string bytes() {
-        sqlite3_int64 size = 0;
-        unsigned char* data = sqlite3_serialize(db_, "main", &size, 0);
-        if (data == nullptr) {
-            throw std::runtime_error("vehicles.db could not be saved");
-        }
-        std::string out(reinterpret_cast<char*>(data), static_cast<std::size_t>(size));
-        sqlite3_free(data);
-        return out;
-    }
-
-private:
-    sqlite3* db_ = nullptr;
-};
-
 std::vector<std::int64_t> editVehicles(std::string& bytes, const std::unordered_set<std::int64_t>& doomed) {
-    Database db(bytes);
-    sqlite3_stmt* table = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vehicles'");
-    bool hasTable = sqlite3_step(table) == SQLITE_ROW;
-    sqlite3_finalize(table);
-    if (!hasTable) {
+    Database db("vehicles.db", bytes);
+    if (!db.hasTable("vehicles")) {
         return {};
     }
     std::vector<std::int64_t> ids;
-    sqlite3_stmt* rows = db.prepare("SELECT id, wx, wy FROM vehicles");
-    while (sqlite3_step(rows) == SQLITE_ROW) {
-        if (doomed.count(chunkKey(sqlite3_column_int(rows, 1), sqlite3_column_int(rows, 2))) > 0) {
-            ids.push_back(sqlite3_column_int64(rows, 0));
+    {
+        Statement rows = db.prepare("SELECT id, wx, wy FROM vehicles");
+        while (rows.step()) {
+            if (doomed.count(chunkKey(sqlite3_column_int(rows.get(), 1), sqlite3_column_int(rows.get(), 2))) > 0) {
+                ids.push_back(sqlite3_column_int64(rows.get(), 0));
+            }
         }
     }
-    sqlite3_finalize(rows);
     if (ids.empty()) {
         return ids;
     }
     db.exec("BEGIN");
-    sqlite3_stmt* remove = db.prepare("DELETE FROM vehicles WHERE id = ?");
-    for (std::int64_t id : ids) {
-        sqlite3_bind_int64(remove, 1, id);
-        if (sqlite3_step(remove) != SQLITE_DONE) {
-            sqlite3_finalize(remove);
-            throw std::runtime_error("vehicles.db: a vehicle row could not be removed");
+    {
+        Statement remove = db.prepare("DELETE FROM vehicles WHERE id = ?");
+        for (std::int64_t id : ids) {
+            sqlite3_bind_int64(remove.get(), 1, id);
+            remove.step();
+            remove.reset();
         }
-        sqlite3_reset(remove);
     }
-    sqlite3_finalize(remove);
     db.exec("COMMIT");
-    sqlite3_stmt* check = db.prepare("PRAGMA integrity_check");
-    bool ok = sqlite3_step(check) == SQLITE_ROW &&
-              std::string(reinterpret_cast<const char*>(sqlite3_column_text(check, 0))) == "ok";
-    sqlite3_finalize(check);
+    Statement check = db.prepare("PRAGMA integrity_check");
+    bool ok = check.step() && std::string(reinterpret_cast<const char*>(sqlite3_column_text(check.get(), 0))) == "ok";
     if (!ok) {
         throw std::runtime_error("vehicles.db failed its integrity check after the edit, so it was left as it was");
     }
@@ -228,7 +181,7 @@ struct Job {
     }
 };
 
-std::vector<std::int64_t> deleteVehicles(Job& job, const std::vector<std::pair<int, int>>& chunks) {
+std::vector<std::int64_t> deleteVehicles(Job& job, const Pairs& chunks) {
     try {
         if (job.store.stat(joinPath(job.root, "vehicles.db-journal")).size > 0) {
             throw std::runtime_error("vehicles.db has an unfinished write journal next to it. Start and stop the game "
@@ -264,7 +217,7 @@ std::vector<std::int64_t> deleteVehicles(Job& job, const std::vector<std::pair<i
     return ids;
 }
 
-void deleteChunks(Job& job, const std::vector<std::pair<int, int>>& chunks) {
+void deleteChunks(Job& job, const Pairs& chunks) {
     std::vector<int> columns;
     std::unordered_set<int> seen;
     for (const auto& chunk : chunks) {
@@ -292,8 +245,7 @@ void deleteChunks(Job& job, const std::vector<std::pair<int, int>>& chunks) {
     runPool(columns, kFileWorkers, removeColumn);
 }
 
-std::int64_t deleteCellFiles(Job& job, const std::vector<std::pair<int, int>>& cells,
-                             const std::vector<std::string>& kinds) {
+std::int64_t deleteCellFiles(Job& job, const Pairs& cells, const std::vector<std::string>& kinds) {
     std::atomic<std::int64_t> removed{0};
     for (const std::string& kind : kinds) {
         if (!job.batch.empty()) {
@@ -311,40 +263,25 @@ std::int64_t deleteCellFiles(Job& job, const std::vector<std::pair<int, int>>& c
     return removed.load();
 }
 
-std::vector<std::pair<int, int>> pairs(const json& list) {
-    std::vector<std::pair<int, int>> out;
-    out.reserve(list.size());
-    for (const auto& item : list) {
-        out.emplace_back(item.at(0).get<int>(), item.at(1).get<int>());
-    }
-    return out;
 }
 
-}
-
-json App::open(std::shared_ptr<Store> store, const std::string& root) {
+std::string App::open(std::shared_ptr<Store> store, const std::string& root) {
     std::lock_guard lock(mutex_);
     session_ = {std::move(store), root, backupDir(root)};
-    return {{"name", baseName(root)}};
+    return baseName(root);
 }
 
-json App::connect(const json& request) {
-    std::string host = request.value("host", "");
-    std::string user = request.value("user", "");
-    std::string password = request.value("password", "");
-    std::string root = trimRoot(request.value("path", ""));
-    int port = request.value("port", 0);
-    if (host.empty() || user.empty() || password.empty() || root.empty()) {
+ConnectResult App::connect(const ConnectRequest& request) {
+    std::string root = trimRoot(request.path);
+    if (request.host.empty() || request.user.empty() || request.password.empty() || root.empty()) {
         throw std::runtime_error("fill in the host, the user, the password and the save folder path");
     }
-    if (port == 0) {
-        port = 22;
-    }
+    int port = request.port == 0 ? 22 : request.port;
     sftp::UnknownHost unknown;
     std::unique_ptr<sftp::Link> link =
-        sftp::Link::open(host, port, user, password, request.value("trust", ""), knownHosts_, unknown);
+        sftp::Link::open(request.host, port, request.user, request.password, request.trust, knownHosts_, unknown);
     if (!link) {
-        return {{"fingerprint", unknown.fingerprint}, {"keyType", unknown.keyType}};
+        return {"", unknown.fingerprint, unknown.keyType};
     }
     auto store = std::make_shared<RemoteStore>(std::move(link));
     try {
@@ -354,10 +291,10 @@ json App::connect(const json& request) {
     } catch (const std::exception& error) {
         throw std::runtime_error("could not open the save folder " + root + ": " + error.what());
     }
-    return open(store, root);
+    return {open(store, root), "", ""};
 }
 
-json App::openLocal(const std::string& dir) {
+std::string App::openLocal(const std::string& dir) {
     std::string root = dir;
     for (char& c : root) {
         if (c == '\\') {
@@ -365,6 +302,9 @@ json App::openLocal(const std::string& dir) {
         }
     }
     root = trimRoot(root);
+    if (root.empty()) {
+        throw std::runtime_error("fill in the folder path");
+    }
     auto store = std::make_shared<LocalStore>();
     if (!store->stat(root).dir) {
         throw std::runtime_error("that path is a file, not a folder");
@@ -384,158 +324,111 @@ void App::disconnect() {
 App::Session App::current() {
     std::lock_guard lock(mutex_);
     if (!session_.store) {
-        throw NamedError("NotConnectedError", "no save is open");
+        throw std::runtime_error("no save is open");
     }
     return session_;
 }
 
-std::pair<std::shared_ptr<Store>, std::string> App::resolve(const std::string& rel) {
+Pairs App::index() {
     Session session = current();
-    if (rel.empty()) {
-        return {session.store, session.root};
+    std::string full = joinPath(session.root, "map");
+    if (!hasFolder(*session.store, full)) {
+        return {};
     }
-    std::vector<std::string> parts;
-    std::size_t start = 0;
-    for (;;) {
-        std::size_t slash = rel.find('/', start);
-        std::string part = rel.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
-        if (part.empty() || part == "." || part == ".." || part.find('\\') != std::string::npos) {
-            throw NamedError("TypeError", "bad path " + rel);
-        }
-        parts.push_back(part);
-        if (slash == std::string::npos) {
-            break;
-        }
-        start = slash + 1;
-    }
-    std::string full = parts[0] == kTrashDir ? session.backup : joinPath(session.root, parts[0]);
-    for (std::size_t i = 1; i < parts.size(); ++i) {
-        full = joinPath(full, parts[i]);
-    }
-    return {session.store, full};
-}
-
-json App::list(const std::string& rel) {
-    auto [store, full] = resolve(rel);
-    json out = json::array();
-    for (const Entry& entry : store->readDir(full)) {
-        out.push_back({{"name", entry.name}, {"dir", entry.dir}, {"size", entry.size}});
-    }
-    return out;
-}
-
-json App::stat(const std::string& rel) {
-    auto [store, full] = resolve(rel);
-    Entry entry = store->stat(full);
-    return {{"name", entry.name}, {"dir", entry.dir}, {"size", entry.size}};
-}
-
-std::string App::read(const std::string& rel) {
-    auto [store, full] = resolve(rel);
-    return base64Encode(store->readFile(full));
-}
-
-void App::write(const std::string& rel, const std::string& base64) {
-    auto [store, full] = resolve(rel);
-    store->writeFile(full, base64Decode(base64));
-}
-
-void App::mkdir(const std::string& rel) {
-    auto [store, full] = resolve(rel);
-    store->mkdirAll(full);
-}
-
-void App::rename(const std::string& from, const std::string& to) {
-    auto [store, fullFrom] = resolve(from);
-    auto fullTo = resolve(to).second;
-    store->rename(fullFrom, fullTo);
-}
-
-void App::remove(const std::string& rel, bool recursive) {
-    auto [store, full] = resolve(rel);
-    Entry entry = store->stat(full);
-    if (entry.dir && recursive) {
-        removeTree(*store, full);
-    }
-    try {
-        store->remove(full);
-    } catch (const FsError& error) {
-        if (entry.dir && !recursive && !store->readDir(full).empty()) {
-            throw NamedError("InvalidModificationError", rel + " is not empty");
-        }
-        throw;
-    }
-}
-
-json App::index(const std::string& rel) {
-    auto [store, full] = resolve(rel);
     std::vector<int> columns;
-    for (const Entry& entry : store->readDir(full)) {
+    for (const Entry& entry : session.store->readDir(full)) {
         int x = 0;
         if (entry.dir && parseInt(entry.name, x)) {
             columns.push_back(x);
         }
     }
     std::mutex mutex;
-    std::vector<int> flat;
+    Pairs chunks;
     std::atomic<std::int64_t> done{0};
     {
         Reporter reporter(progress_, done, static_cast<std::int64_t>(columns.size()));
         std::function<void(const int&)> listColumn = [&](const int& x) {
-            std::vector<Entry> names = store->readDir(joinPath(full, std::to_string(x)));
-            std::vector<int> found;
-            found.reserve(names.size() * 2);
+            std::vector<Entry> names = session.store->readDir(joinPath(full, std::to_string(x)));
+            Pairs found;
+            found.reserve(names.size());
             for (const Entry& entry : names) {
                 int y = 0;
                 if (parseChunkName(entry.name, y)) {
-                    found.push_back(x);
-                    found.push_back(y);
+                    found.emplace_back(x, y);
                 }
             }
             std::lock_guard lock(mutex);
-            flat.insert(flat.end(), found.begin(), found.end());
+            chunks.insert(chunks.end(), found.begin(), found.end());
             ++done;
         };
         runPool(columns, kListWorkers, listColumn);
     }
-    return flat;
+    return chunks;
 }
 
-json App::execute(const json& request) {
+std::optional<std::string> App::readFile(const std::string& name) {
     Session session = current();
-    std::vector<std::pair<int, int>> chunks = pairs(request.at("chunks"));
-    std::vector<std::pair<int, int>> cells = pairs(request.at("cells"));
-    std::vector<std::string> kinds = request.at("cellKinds").get<std::vector<std::string>>();
-    for (const std::string& kind : kinds) {
+    try {
+        return session.store->readFile(joinPath(session.root, name));
+    } catch (const FsError& error) {
+        if (error.notFound) {
+            return std::nullopt;
+        }
+        throw;
+    }
+}
+
+std::vector<std::string> App::listTrash() {
+    Session session = current();
+    if (!hasFolder(*session.store, session.backup)) {
+        return {};
+    }
+    std::vector<std::string> stamps;
+    for (const Entry& entry : session.store->readDir(session.backup)) {
+        if (entry.dir) {
+            stamps.push_back(entry.name);
+        }
+    }
+    std::sort(stamps.begin(), stamps.end());
+    return stamps;
+}
+
+ExecuteResult App::execute(const ExecuteRequest& request) {
+    Session session = current();
+    for (const std::string& kind : request.cellKinds) {
         if (kCellKinds.count(kind) == 0) {
             throw std::runtime_error("unknown cell file kind " + kind);
         }
     }
     Job job{*session.store, session.root, ""};
-    json result = {{"cellFiles", 0}, {"vehicleIds", json::array()}, {"stamp", ""}};
-    if (request.value("trash", true)) {
-        std::string stamp = stampNow();
-        result["stamp"] = stamp;
-        job.batch = joinPath(session.backup, stamp);
+    ExecuteResult result;
+    if (request.trash) {
+        result.stamp = stampNow();
+        job.batch = joinPath(session.backup, result.stamp);
         job.store.mkdirAll(job.batch);
     }
     Reporter reporter(progress_, job.done,
-                      static_cast<std::int64_t>(chunks.size() + cells.size() * kinds.size()));
-    if (request.value("vehicles", false)) {
-        result["vehicleIds"] = deleteVehicles(job, chunks);
+                      static_cast<std::int64_t>(request.chunks.size() + request.cells.size() * request.cellKinds.size()));
+    if (request.vehicles) {
+        result.vehicleIds = deleteVehicles(job, request.chunks);
     }
-    deleteChunks(job, chunks);
-    result["cellFiles"] = deleteCellFiles(job, cells, kinds);
+    deleteChunks(job, request.chunks);
+    result.cellFiles = deleteCellFiles(job, request.cells, request.cellKinds);
     return result;
 }
 
 std::int64_t App::restore(const std::string& stamp) {
-    auto [store, batch] = resolve(kTrashDir + "/" + stamp);
     Session session = current();
-    Tree tree = walk(*store, batch);
+    if (stamp.empty() || stamp.find('/') != std::string::npos || stamp.find('\\') != std::string::npos ||
+        stamp == "." || stamp == "..") {
+        throw std::runtime_error("bad trash batch name " + stamp);
+    }
+    Store& store = *session.store;
+    std::string batch = joinPath(session.backup, stamp);
+    Tree tree = walk(store, batch);
     for (std::size_t i = 1; i < tree.levels.size(); ++i) {
         std::function<void(const std::string&)> makeDir = [&](const std::string& dir) {
-            store->mkdirAll(session.root + dir.substr(batch.size()));
+            store.mkdirAll(session.root + dir.substr(batch.size()));
         };
         runPool(tree.levels[i], kFileWorkers, makeDir);
     }
@@ -543,18 +436,24 @@ std::int64_t App::restore(const std::string& stamp) {
     {
         Reporter reporter(progress_, done, static_cast<std::int64_t>(tree.files.size()));
         std::function<void(const std::string&)> putBack = [&](const std::string& file) {
-            store->replace(file, session.root + file.substr(batch.size()));
+            store.replace(file, session.root + file.substr(batch.size()));
             ++done;
         };
         runPool(tree.files, kFileWorkers, putBack);
     }
-    removeTree(*store, batch);
-    store->remove(batch);
+    removeTree(store, batch);
+    store.remove(batch);
     try {
-        if (store->readDir(session.backup).empty()) {
-            store->remove(session.backup);
+        if (store.readDir(session.backup).empty()) {
+            store.remove(session.backup);
         }
     } catch (const std::exception&) {
     }
     return static_cast<std::int64_t>(tree.files.size());
+}
+
+void App::emptyTrash() {
+    Session session = current();
+    removeTree(*session.store, session.backup);
+    session.store->remove(session.backup);
 }
