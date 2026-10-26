@@ -1322,7 +1322,7 @@ void Ui::drawServerTab() {
     ImGui::Checkbox("Show password", &reveal_);
     ImGui::TextColored(kMuted, "Save folder on the server");
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputTextWithHint("##path", "/home/pz/Zomboid/Saves/Multiplayer/servertest", &path_);
+    ImGui::InputTextWithHint("##path", "/server-data/Saves/Multiplayer/pzserver/", &path_);
     ImGui::EndDisabled();
     if (!trustText_.empty()) {
         wrapped(trustText_);
